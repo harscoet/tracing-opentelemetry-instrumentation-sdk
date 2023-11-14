@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
+use http::{HeaderName, HeaderValue};
 use opentelemetry::sdk::trace::{Sampler, Tracer};
 use opentelemetry::sdk::Resource;
 use opentelemetry::trace::TraceError;
 use opentelemetry_otlp::SpanExporterBuilder;
+use tonic::metadata::MetadataMap;
 #[cfg(feature = "tls")]
 use tonic::transport::ClientTlsConfig;
 
@@ -28,16 +31,19 @@ where
         "http/protobuf" => opentelemetry_otlp::new_exporter()
             .http()
             .with_endpoint(endpoint)
+            .with_headers(read_http_headers_from_env())
             .into(),
         #[cfg(feature = "tls")]
         "grpc/tls" => opentelemetry_otlp::new_exporter()
             .tonic()
             .with_tls_config(ClientTlsConfig::new())
             .with_endpoint(endpoint)
+            .with_metadata(read_tonic_metadata_from_env())
             .into(),
         _ => opentelemetry_otlp::new_exporter()
             .tonic()
             .with_endpoint(endpoint)
+            .with_metadata(read_tonic_metadata_from_env())
             .into(),
     };
 
@@ -99,6 +105,54 @@ where
         .map_or(default, |s| T::from_str(&s).unwrap_or(default));
     tracing::debug!(target: "otel::setup", OTEL_TRACES_SAMPLER_ARG = ?v);
     v
+}
+
+fn read_raw_headers_from_env() -> Option<String> {
+    std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .ok()
+}
+
+fn read_http_headers_from_env() -> HashMap<String, String> {
+    read_raw_headers_from_env()
+        .map(|raw_headers| {
+            raw_headers_to_key_value_iter(&raw_headers)
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_tonic_metadata_from_env() -> MetadataMap {
+    read_raw_headers_from_env()
+        .map(|raw_headers| {
+            MetadataMap::from_headers(
+                raw_headers_to_key_value_iter(&raw_headers)
+                    .filter_map(|(key, value)| {
+                        Some((
+                            HeaderName::from_str(key).ok()?,
+                            HeaderValue::from_str(value).ok()?,
+                        ))
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn raw_headers_to_key_value_iter(value: &str) -> impl Iterator<Item = (&str, &str)> {
+    value
+        .split_terminator(',')
+        .map(str::trim)
+        .filter_map(|pair| {
+            if pair.is_empty() {
+                None
+            } else {
+                pair.split_once('=')
+                    .map(|(key, value)| (key.trim(), value.trim()))
+                    .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            }
+        })
 }
 
 fn infer_protocol_and_endpoint(
@@ -178,5 +232,70 @@ mod tests {
             infer_protocol_and_endpoint(traces_protocol, traces_endpoint)
                 == (expected_protocol.to_string(), expected_endpoint.to_string())
         );
+    }
+
+    #[rstest]
+    #[case(
+        "k3=val=10,22,34,k4=,k5=10",
+        vec![("k3", "val=10"), ("k5", "10")]
+    )]
+    #[case(
+        "",
+        vec![]
+    )]
+    #[case(
+        "k1=foo,  k2 = bar, ,=, k3=1",
+        vec![("k1", "foo"), ("k2", "bar"), ("k3", "1")]
+    )]
+    fn test_raw_headers_to_key_value_iter(
+        #[case] raw_headers: &str,
+        #[case] expected_key_values: Vec<(&str, &str)>,
+    ) {
+        assert_eq!(
+            raw_headers_to_key_value_iter(raw_headers).collect::<Vec<_>>(),
+            expected_key_values
+        );
+    }
+
+    #[rstest]
+    #[case(
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        Some("k1=foo,k2=bar"),
+        vec![("k1", "foo"), ("k2", "bar")]
+    )]
+    #[case(
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        Some(""),
+        vec![]
+    )]
+    #[case(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        Some("k1=foo,k2=bar"),
+        vec![("k1", "foo"), ("k2", "bar")]
+    )]
+    #[case(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        None,
+        vec![]
+    )]
+    #[case(
+        "WRONG_ENV_VAR_NAME",
+        Some("k1=foo,k2=bar"),
+        vec![]
+    )]
+    fn test_read_http_headers_from_env(
+        #[case] env_var_name: &str,
+        #[case] env_var_value: Option<&str>,
+        #[case] expected_key_values: Vec<(&str, &str)>,
+    ) {
+        temp_env::with_var(env_var_name, env_var_value, || {
+            assert_eq!(
+                read_http_headers_from_env(),
+                expected_key_values
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            );
+        });
     }
 }
